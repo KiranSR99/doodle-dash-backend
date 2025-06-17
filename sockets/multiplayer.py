@@ -42,12 +42,13 @@ def register_multiplayer_events(socketio):
 
         room_code = generate_room_code()
         rooms[room_code] = {
+            'room_code': room_code,
             'players': [{'id': request.sid, 'name': name}],
             'status': 'waiting'
         }
         join_room(room_code)
         print(f"[SUCCESS] Room {room_code} created by {name} (sid: {request.sid})")
-        emit('room_created', {'room_code': room_code}, room=request.sid)
+        emit('room_created', rooms[room_code], room=request.sid)
 
     @socketio.on('join_room')
     def join_existing_room(data):
@@ -63,9 +64,10 @@ def register_multiplayer_events(socketio):
 
         rooms[room_code]['players'].append({'id': request.sid, 'name': name})
         join_room(room_code)
+        rooms[room_code]['status'] = 'ready' if len(rooms[room_code]['players']) == 2 else 'waiting'
         print(f"[SUCCESS] {name} joined room {room_code} (sid: {request.sid})")
 
-        emit('room_joined', {'room_code': room_code}, room=request.sid)
+        emit('room_joined', rooms[room_code], room=request.sid)
         emit('both_players_ready', rooms[room_code], room=room_code)
 
     @socketio.on('leave_room')
@@ -79,12 +81,21 @@ def register_multiplayer_events(socketio):
         if len(updated_players) < len(players):
             rooms[room_code]['players'] = updated_players
             leave_room(room_code)
-            emit('player_left', {'room_code': room_code}, room=room_code)
+            emit('player_left', rooms[room_code], room=room_code)
             print(f"[INFO] Player left room {room_code} (sid: {request.sid})")
             if not updated_players:
                 del rooms[room_code]
                 print(f"[INFO] Deleted empty room {room_code}")
         else:
             send_error('You are not part of this room')
+
+    @socketio.on('get_room_data')
+    def handle_get_room_data(data):
+        room_code = data.get('room_code')
+        if room_code in rooms:
+            emit('room_data', rooms[room_code], room=request.sid)
+        else:
+            emit('error', {'message': 'Room not found'}, room=request.sid)
+
 
     print("[INFO] Multiplayer events registered successfully")
