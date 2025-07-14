@@ -22,11 +22,11 @@ def send_error(message):
 def find_and_remove_player(sid):
     for code, room in list(rooms.items()):
         players = room['players']
-        updated_players = [p for p in players if p['id'] != sid]
-        if len(updated_players) < len(players):
-            room['players'] = updated_players
+        updated = [p for p in players if p['id'] != sid]
+        if len(updated) < len(players):
+            room['players'] = updated
             emit('player_disconnected', {'room_code': code}, room=code)
-            if not updated_players:
+            if not updated:
                 del rooms[code]
                 print(f"[INFO] Deleted empty room {code}")
 
@@ -63,7 +63,7 @@ def register_multiplayer_events(socketio):
             'room_code': room_code,
             'players': [{'id': request.sid, 'name': name}],
             'status': 'waiting',
-            'creator': request.sid  # 🆕 Store creator's sid
+            'creator': name
         }
         join_room(room_code)
         print(f"[SUCCESS] Room {room_code} created by {name} (sid: {request.sid})")
@@ -73,7 +73,6 @@ def register_multiplayer_events(socketio):
     def join_existing_room(data):
         room_code = data.get('room_code')
         name = data.get('name')
-
         if not room_code or not name:
             return send_error('Room code and name are required.')
         if room_code not in rooms:
@@ -85,7 +84,6 @@ def register_multiplayer_events(socketio):
         join_room(room_code)
         rooms[room_code]['status'] = 'ready' if len(rooms[room_code]['players']) == 2 else 'waiting'
         print(f"[SUCCESS] {name} joined room {room_code} (sid: {request.sid})")
-
         emit('room_joined', get_public_room_data(rooms[room_code]), room=request.sid)
         emit('both_players_ready', get_public_room_data(rooms[room_code]), room=room_code)
 
@@ -96,13 +94,13 @@ def register_multiplayer_events(socketio):
             return send_error('Invalid room code')
 
         players = rooms[room_code]['players']
-        updated_players = [p for p in players if p['id'] != request.sid]
-        if len(updated_players) < len(players):
-            rooms[room_code]['players'] = updated_players
+        updated = [p for p in players if p['id'] != request.sid]
+        if len(updated) < len(players):
+            rooms[room_code]['players'] = updated
             leave_room(room_code)
             emit('player_left', get_public_room_data(rooms[room_code]), room=room_code)
             print(f"[INFO] Player left room {room_code} (sid: {request.sid})")
-            if not updated_players:
+            if not updated:
                 del rooms[room_code]
                 print(f"[INFO] Deleted empty room {room_code}")
         else:
@@ -125,21 +123,20 @@ def register_multiplayer_events(socketio):
             return send_error('Room not found.')
 
         room = rooms[room_code]
+        creator = room['creator']
+        creator_sid = next((p['id'] for p in room['players'] if p['name'] == creator), None)
 
-        if request.sid != room['creator']:
-            return send_error('Only the room creator can start the game.')
+        if request.sid != creator_sid:
+            return send_error('Only the creator can start the game.')
 
         try:
             words = random.sample(WORDS, 5)
             room['words'] = words
-            room['current_round'] = 0
+            room['round_progress'] = {}
+            print(f"[GAME STARTED] Room: {room_code}, Words: {words}")
 
-            emit('start_round', {
-                'round': 1,
-                'word': words[0]
-            }, room=room_code)
+            emit('game_started', {}, room=room_code)
 
-            print(f"[GAME STARTED] Room: {room_code}, Word: {words[0]}")
         except ValueError:
             send_error('Not enough words to start the game.')
 
@@ -150,22 +147,24 @@ def register_multiplayer_events(socketio):
             return send_error('Room not found.')
 
         room = rooms[room_code]
-        current_round = room.get('current_round', 0)
-        words = room.get('words', [])
+        sid = request.sid
+        if 'words' not in room:
+            return send_error('Game not initialized.')
 
-        if not words:
-            return send_error('Game has not started yet.')
+        words = room['words']
+        progress = room.setdefault('round_progress', {})
+        current_round = progress.get(sid, 0)
 
-        if current_round + 1 >= len(words):
-            emit('game_over', {}, room=room_code)
-            print(f"[GAME OVER] Room: {room_code}")
+        if current_round >= len(words):
+            emit('game_over', {}, room=sid)
+            print(f"[GAME OVER for player] SID: {sid}")
         else:
-            room['current_round'] += 1
-            next_word = words[room['current_round']]
+            word = words[current_round]
+            progress[sid] = current_round + 1
             emit('start_round', {
-                'round': room['current_round'] + 1,
-                'word': next_word
-            }, room=room_code)
-            print(f"[NEXT ROUND] Room: {room_code}, Word: {next_word}")
+                'round': current_round + 1,
+                'word': word
+            }, room=sid)  # ✅ Emit only to the requesting player
+
 
     print("[INFO] Multiplayer events registered successfully")
