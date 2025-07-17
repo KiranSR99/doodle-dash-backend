@@ -66,7 +66,6 @@ def register_multiplayer_events(socketio):
             'creator': name
         }
         join_room(room_code)
-        print(f"[SUCCESS] Room {room_code} created by {name} (sid: {request.sid})")
         emit('room_created', get_public_room_data(rooms[room_code]), room=request.sid)
 
     @socketio.on('join_room')
@@ -83,7 +82,6 @@ def register_multiplayer_events(socketio):
         rooms[room_code]['players'].append({'id': request.sid, 'name': name})
         join_room(room_code)
         rooms[room_code]['status'] = 'ready' if len(rooms[room_code]['players']) == 2 else 'waiting'
-        print(f"[SUCCESS] {name} joined room {room_code} (sid: {request.sid})")
         emit('room_joined', get_public_room_data(rooms[room_code]), room=request.sid)
         emit('both_players_ready', get_public_room_data(rooms[room_code]), room=room_code)
 
@@ -99,10 +97,8 @@ def register_multiplayer_events(socketio):
             rooms[room_code]['players'] = updated
             leave_room(room_code)
             emit('player_left', get_public_room_data(rooms[room_code]), room=room_code)
-            print(f"[INFO] Player left room {room_code} (sid: {request.sid})")
             if not updated:
                 del rooms[room_code]
-                print(f"[INFO] Deleted empty room {room_code}")
         else:
             send_error('You are not part of this room')
 
@@ -133,10 +129,8 @@ def register_multiplayer_events(socketio):
             words = random.sample(WORDS, 5)
             room['words'] = words
             room['round_progress'] = {}
-            print(f"[GAME STARTED] Room: {room_code}, Words: {words}")
-
+            room['score_progress'] = {}
             emit('game_started', {}, room=room_code)
-
         except ValueError:
             send_error('Not enough words to start the game.')
 
@@ -148,23 +142,61 @@ def register_multiplayer_events(socketio):
 
         room = rooms[room_code]
         sid = request.sid
+
         if 'words' not in room:
             return send_error('Game not initialized.')
 
-        words = room['words']
         progress = room.setdefault('round_progress', {})
         current_round = progress.get(sid, 0)
+        words = room['words']
 
         if current_round >= len(words):
             emit('game_over', {}, room=sid)
-            print(f"[GAME OVER for player] SID: {sid}")
         else:
             word = words[current_round]
             progress[sid] = current_round + 1
             emit('start_round', {
                 'round': current_round + 1,
                 'word': word
-            }, room=sid)  # ✅ Emit only to the requesting player
+            }, room=sid)
 
+    @socketio.on('submit_score')
+    def handle_submit_score(data):
+        room_code = data.get('room_code')
+        score = data.get('score')
+        if not room_code or room_code not in rooms or score is None:
+            return send_error('Invalid score or room.')
+
+        sid = request.sid
+        room = rooms[room_code]
+
+        # Store score
+        scores = room.setdefault('score_progress', {})
+        previous = scores.get(sid, [])
+        previous.append(score)
+        scores[sid] = previous
+
+        # Broadcast score and round status
+        progress = room.get('round_progress', {})
+        current_round = progress.get(sid, 0)
+        total_rounds = len(room.get('words', []))
+
+        emit('player_progress', {
+            'player_id': sid,
+            'round': current_round,
+            'total_rounds': total_rounds,
+            'score': sum(previous)
+        }, room=room_code)
+
+        # Check if both players are finished
+        all_done = all(progress.get(p['id'], 0) >= total_rounds for p in room['players'])
+        if all_done:
+            final_scores = {
+                p['id']: sum(room['score_progress'].get(p['id'], []))
+                for p in room['players']
+            }
+            emit('game_over', {
+                'final_scores': final_scores
+            }, room=room_code)
 
     print("[INFO] Multiplayer events registered successfully")
