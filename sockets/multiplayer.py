@@ -176,13 +176,17 @@ def register_multiplayer_events(socketio):
         previous.append(score)
         scores[sid] = previous
 
-        # Broadcast score and round status
+        # Find player name from ID
+        player_name = next((p['name'] for p in room['players'] if p['id'] == sid), 'Unknown')
+
+        # Round progress
         progress = room.get('round_progress', {})
         current_round = progress.get(sid, 0)
         total_rounds = len(room.get('words', []))
 
         emit('player_progress', {
             'player_id': sid,
+            'player_name': player_name,
             'round': current_round,
             'total_rounds': total_rounds,
             'score': sum(previous)
@@ -192,11 +196,15 @@ def register_multiplayer_events(socketio):
         all_done = all(progress.get(p['id'], 0) >= total_rounds for p in room['players'])
         if all_done:
             final_scores = {
-                p['id']: sum(room['score_progress'].get(p['id'], []))
+                p['id']: {
+                    'name': p['name'],
+                    'score': sum(room['score_progress'].get(p['id'], []))
+                }
                 for p in room['players']
             }
             emit('game_over', {
                 'final_scores': final_scores
             }, room=room_code)
+
 
     print("[INFO] Multiplayer events registered successfully")
