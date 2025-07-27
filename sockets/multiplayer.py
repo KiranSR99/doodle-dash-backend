@@ -24,8 +24,16 @@ def find_and_remove_player(sid):
         players = room['players']
         updated = [p for p in players if p['id'] != sid]
         if len(updated) < len(players):
+            # Check if the leaving player was the creator
+            leaving_player = next((p for p in players if p['id'] == sid), None)
+            if leaving_player and room['creator'] == leaving_player['name'] and updated:
+                # Assign new creator
+                room['creator'] = updated[0]['name']
+                emit('creator_changed', {'new_creator': room['creator']}, room=code)
+
             room['players'] = updated
             emit('player_disconnected', {'room_code': code}, room=code)
+
             if not updated:
                 del rooms[code]
                 print(f"[INFO] Deleted empty room {code}")
@@ -91,16 +99,38 @@ def register_multiplayer_events(socketio):
         if not room_code or room_code not in rooms:
             return send_error('Invalid room code')
 
-        players = rooms[room_code]['players']
-        updated = [p for p in players if p['id'] != request.sid]
-        if len(updated) < len(players):
-            rooms[room_code]['players'] = updated
-            leave_room(room_code)
-            emit('player_left', get_public_room_data(rooms[room_code]), room=room_code)
-            if not updated:
-                del rooms[room_code]
-        else:
-            send_error('You are not part of this room')
+        room = rooms[room_code]
+        players = room['players']
+        sid = request.sid
+
+        # Filter out the leaving player
+        updated_players = [p for p in players if p['id'] != sid]
+
+        if len(updated_players) == len(players):
+            return send_error('You are not part of this room')
+
+        # Identify the leaving player
+        leaving_player = next((p for p in players if p['id'] == sid), None)
+
+        # Reassign creator if necessary
+        if leaving_player and room['creator'] == leaving_player['name'] and updated_players:
+            room['creator'] = updated_players[0]['name']
+            emit('creator_changed', {'new_creator': room['creator']}, room=room_code)
+
+        room['players'] = updated_players
+
+        # Reset room status to 'waiting' if game was ready
+        room['status'] = 'waiting'
+
+        # Notify others and remove from room
+        leave_room(room_code)
+        emit('player_left', get_public_room_data(room), room=room_code)
+
+        # If all players have left, delete the room
+        if not updated_players:
+            del rooms[room_code]
+
+
 
     @socketio.on('get_room_data')
     def handle_get_room_data(data):
