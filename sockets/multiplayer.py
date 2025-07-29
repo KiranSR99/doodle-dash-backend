@@ -2,6 +2,8 @@ from flask import request
 from flask_socketio import join_room, leave_room, emit
 import random
 import string
+import time
+import threading
 
 rooms = {}
 
@@ -26,10 +28,17 @@ def find_and_remove_player(sid):
         if len(updated) < len(players):
             # Check if the leaving player was the creator
             leaving_player = next((p for p in players if p['id'] == sid), None)
-            if leaving_player and room['creator'] == leaving_player['name'] and updated:
-                # Assign new creator
-                room['creator'] = updated[0]['name']
-                emit('creator_changed', {'new_creator': room['creator']}, room=code)
+            
+            # Handle mid-game disconnection
+            if room['status'] == 'in_progress':
+                handle_mid_game_disconnection(code, leaving_player, updated)
+            elif room['status'] in ['finished', 'post_game', 'rematch_pending']:
+                handle_post_game_disconnection(code, leaving_player, updated)
+            else:
+                # Normal lobby disconnection
+                if leaving_player and room['creator'] == leaving_player['name'] and updated:
+                    room['creator'] = updated[0]['name']
+                    emit('creator_changed', {'new_creator': room['creator']}, room=code)
 
             room['players'] = updated
             emit('player_disconnected', {'room_code': code}, room=code)
@@ -38,6 +47,84 @@ def find_and_remove_player(sid):
                 del rooms[code]
                 print(f"[INFO] Deleted empty room {code}")
 
+def handle_mid_game_disconnection(room_code, leaving_player, remaining_players):
+    """Handle player leaving during active game"""
+    room = rooms[room_code]
+    
+    if remaining_players:
+        # End game immediately for remaining player
+        remaining_player = remaining_players[0]
+        
+        # Calculate remaining player's final score
+        scores = room.get('score_progress', {})
+        remaining_score = sum(scores.get(remaining_player['id'], []))
+        
+        # Set new creator if leaving player was creator
+        if room['creator'] == leaving_player['name']:
+            room['creator'] = remaining_player['name']
+            emit('creator_changed', {'new_creator': room['creator']}, room=room_code)
+        
+        # Send game abandoned notification
+        emit('game_abandoned', {
+            'message': f"{leaving_player['name']} left the game",
+            'your_score': remaining_score,
+            'you_win': True
+        }, room=remaining_player['id'])
+        
+        room['status'] = 'abandoned'
+        clean_game_data(room)
+
+def handle_post_game_disconnection(room_code, leaving_player, remaining_players):
+    """Handle player leaving after game ends"""
+    room = rooms[room_code]
+    
+    if remaining_players:
+        remaining_player = remaining_players[0]
+        
+        # Set new creator if leaving player was creator
+        if room['creator'] == leaving_player['name']:
+            room['creator'] = remaining_player['name']
+            emit('creator_changed', {'new_creator': room['creator']}, room=room_code)
+        
+        # Force remaining player back to lobby
+        force_return_to_lobby(room_code)
+
+def clean_game_data(room):
+    """Clean up game-specific data from room"""
+    room.pop('words', None)
+    room.pop('round_progress', None)
+    room.pop('score_progress', None)
+    room.pop('lobby_returns', None)
+    room.pop('post_game_timer', None)
+    room.pop('rematch_requests', None)
+    room.pop('rematch_requester', None)
+
+def reset_room_to_lobby(room_code):
+    """Reset room to lobby state"""
+    room = rooms[room_code]
+    room['status'] = 'waiting' if len(room['players']) < 2 else 'ready'
+    clean_game_data(room)
+
+def force_return_to_lobby(room_code):
+    """Force all players back to lobby"""
+    reset_room_to_lobby(room_code)
+    emit('forced_return_to_lobby', {
+        'message': 'Returned to lobby automatically'
+    }, room=room_code)
+
+def check_post_game_timers():
+    """Background task to check for expired post-game timers"""
+    current_time = time.time()
+    expired_rooms = []
+    
+    for room_code, room in rooms.items():
+        if 'post_game_timer' in room and current_time > room['post_game_timer']:
+            expired_rooms.append(room_code)
+    
+    for room_code in expired_rooms:
+        if room_code in rooms:  # Double check room still exists
+            force_return_to_lobby(room_code)
+
 def get_public_room_data(room):
     return {
         'room_code': room['room_code'],
@@ -45,6 +132,16 @@ def get_public_room_data(room):
         'status': room['status'],
         'creator': room['creator']
     }
+
+# === Background Timer Task ===
+def start_timer_thread():
+    def timer_worker():
+        while True:
+            time.sleep(1)  # Check every second
+            check_post_game_timers()
+    
+    timer_thread = threading.Thread(target=timer_worker, daemon=True)
+    timer_thread.start()
 
 # === Socket.IO Multiplayer Logic ===
 
@@ -84,14 +181,21 @@ def register_multiplayer_events(socketio):
             return send_error('Room code and name are required.')
         if room_code not in rooms:
             return send_error('Room does not exist.')
-        if len(rooms[room_code]['players']) >= 2:
+        
+        room = rooms[room_code]
+        
+        # Auto-reset room if joining a finished/abandoned game
+        if room['status'] in ['finished', 'abandoned', 'post_game']:
+            reset_room_to_lobby(room_code)
+        
+        if len(room['players']) >= 2:
             return send_error('Room is full.')
 
-        rooms[room_code]['players'].append({'id': request.sid, 'name': name})
+        room['players'].append({'id': request.sid, 'name': name})
         join_room(room_code)
-        rooms[room_code]['status'] = 'ready' if len(rooms[room_code]['players']) == 2 else 'waiting'
-        emit('room_joined', get_public_room_data(rooms[room_code]), room=request.sid)
-        emit('both_players_ready', get_public_room_data(rooms[room_code]), room=room_code)
+        room['status'] = 'ready' if len(room['players']) == 2 else 'waiting'
+        emit('room_joined', get_public_room_data(room), room=request.sid)
+        emit('both_players_ready', get_public_room_data(room), room=room_code)
 
     @socketio.on('leave_room')
     def leave_current_room(data):
@@ -112,15 +216,19 @@ def register_multiplayer_events(socketio):
         # Identify the leaving player
         leaving_player = next((p for p in players if p['id'] == sid), None)
 
-        # Reassign creator if necessary
-        if leaving_player and room['creator'] == leaving_player['name'] and updated_players:
-            room['creator'] = updated_players[0]['name']
-            emit('creator_changed', {'new_creator': room['creator']}, room=room_code)
+        # Handle different scenarios based on room status
+        if room['status'] == 'in_progress':
+            handle_mid_game_disconnection(room_code, leaving_player, updated_players)
+        elif room['status'] in ['finished', 'post_game', 'rematch_pending']:
+            handle_post_game_disconnection(room_code, leaving_player, updated_players)
+        else:
+            # Normal lobby leave
+            if leaving_player and room['creator'] == leaving_player['name'] and updated_players:
+                room['creator'] = updated_players[0]['name']
+                emit('creator_changed', {'new_creator': room['creator']}, room=room_code)
 
         room['players'] = updated_players
-
-        # Reset room status to 'waiting' if game was ready
-        room['status'] = 'waiting'
+        room['status'] = 'waiting' if len(updated_players) < 2 else room['status']
 
         # Notify others and remove from room
         leave_room(room_code)
@@ -129,8 +237,6 @@ def register_multiplayer_events(socketio):
         # If all players have left, delete the room
         if not updated_players:
             del rooms[room_code]
-
-
 
     @socketio.on('get_room_data')
     def handle_get_room_data(data):
@@ -149,6 +255,14 @@ def register_multiplayer_events(socketio):
             return send_error('Room not found.')
 
         room = rooms[room_code]
+        
+        # Validate room status
+        if room['status'] not in ['ready', 'waiting']:
+            return send_error('Cannot start game. Please wait or return to lobby first.')
+        
+        if len(room['players']) < 2:
+            return send_error('Need 2 players to start the game.')
+
         creator = room['creator']
         creator_sid = next((p['id'] for p in room['players'] if p['name'] == creator), None)
 
@@ -160,6 +274,7 @@ def register_multiplayer_events(socketio):
             room['words'] = words
             room['round_progress'] = {}
             room['score_progress'] = {}
+            room['status'] = 'in_progress'
             emit('game_started', {}, room=room_code)
         except ValueError:
             send_error('Not enough words to start the game.')
@@ -173,8 +288,8 @@ def register_multiplayer_events(socketio):
         room = rooms[room_code]
         sid = request.sid
 
-        if 'words' not in room:
-            return send_error('Game not initialized.')
+        if 'words' not in room or room['status'] != 'in_progress':
+            return send_error('Game not in progress.')
 
         progress = room.setdefault('round_progress', {})
         current_round = progress.get(sid, 0)
@@ -199,6 +314,9 @@ def register_multiplayer_events(socketio):
 
         sid = request.sid
         room = rooms[room_code]
+
+        if room['status'] != 'in_progress':
+            return send_error('Game is not in progress.')
 
         # Store score
         scores = room.setdefault('score_progress', {})
@@ -232,9 +350,114 @@ def register_multiplayer_events(socketio):
                 }
                 for p in room['players']
             }
+            
+            room['status'] = 'finished'
             emit('game_over', {
                 'final_scores': final_scores
             }, room=room_code)
 
+    # === Post-Game Logic ===
+
+    @socketio.on('request_rematch')
+    def handle_request_rematch(data):
+        room_code = data.get('room_code')
+        if room_code not in rooms:
+            return send_error('Room not found.')
+
+        room = rooms[room_code]
+        sid = request.sid
+
+        if room['status'] != 'finished':
+            return send_error('Cannot request rematch. Game not finished.')
+
+        # Set rematch state
+        room['status'] = 'rematch_pending'
+        room['rematch_requester'] = sid
+        
+        requester_name = next((p['name'] for p in room['players'] if p['id'] == sid), 'Unknown')
+        
+        # Notify other player
+        other_players = [p['id'] for p in room['players'] if p['id'] != sid]
+        for other_sid in other_players:
+            emit('rematch_requested', {
+                'requester': requester_name
+            }, room=other_sid)
+
+    @socketio.on('accept_rematch')
+    def handle_accept_rematch(data):
+        room_code = data.get('room_code')
+        if room_code not in rooms:
+            return send_error('Room not found.')
+
+        room = rooms[room_code]
+        
+        if room['status'] != 'rematch_pending':
+            return send_error('No rematch pending.')
+
+        # Start new game immediately
+        try:
+            words = random.sample(WORDS, 5)
+            room['words'] = words
+            room['round_progress'] = {}
+            room['score_progress'] = {}
+            room['status'] = 'in_progress'
+            room.pop('rematch_requester', None)
+            
+            emit('rematch_accepted', {}, room=room_code)
+            emit('game_started', {}, room=room_code)
+        except ValueError:
+            send_error('Not enough words to start the rematch.')
+
+    @socketio.on('decline_rematch')
+    def handle_decline_rematch(data):
+        room_code = data.get('room_code')
+        if room_code not in rooms:
+            return send_error('Room not found.')
+
+        room = rooms[room_code]
+        
+        if room['status'] != 'rematch_pending':
+            return send_error('No rematch pending.')
+
+        # Return both players to lobby
+        reset_room_to_lobby(room_code)
+        emit('rematch_declined', {}, room=room_code)
+        emit('returned_to_lobby', {}, room=room_code)
+
+    @socketio.on('return_to_lobby')
+    def handle_return_to_lobby(data):
+        room_code = data.get('room_code')
+        if room_code not in rooms:
+            return send_error('Room not found.')
+
+        room = rooms[room_code]
+        sid = request.sid
+
+        if room['status'] not in ['finished', 'abandoned']:
+            return send_error('Cannot return to lobby from current game state.')
+
+        # Track who has returned
+        lobby_returns = room.setdefault('lobby_returns', set())
+        lobby_returns.add(sid)
+        
+        # Start timer on first return
+        if 'post_game_timer' not in room:
+            room['post_game_timer'] = time.time() + 15  # 15 second grace period
+            room['status'] = 'post_game'
+        
+        # Check if all players returned
+        if len(lobby_returns) >= len(room['players']):
+            # All returned - immediate reset
+            reset_room_to_lobby(room_code)
+            emit('both_returned_to_lobby', {}, room=room_code)
+        else:
+            # Show waiting message with countdown
+            remaining_time = max(0, int(room['post_game_timer'] - time.time()))
+            emit('waiting_for_other_player', {
+                'remaining_time': remaining_time
+            }, room=sid)
 
     print("[INFO] Multiplayer events registered successfully")
+
+# Start the background timer when the module loads
+start_timer_thread()
