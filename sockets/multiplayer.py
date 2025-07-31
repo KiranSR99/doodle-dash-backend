@@ -433,7 +433,7 @@ def register_multiplayer_events(socketio):
         room = rooms[room_code]
         sid = request.sid
 
-        if room['status'] not in ['finished', 'abandoned']:
+        if room['status'] not in ['finished', 'abandoned', 'post_game']:
             return send_error('Cannot return to lobby from current game state.')
 
         # Track who has returned
