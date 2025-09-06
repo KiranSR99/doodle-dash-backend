@@ -4,49 +4,97 @@ import numpy as np
 import base64
 import io
 from tensorflow.keras.models import load_model
+import os
 
+# ==============================
+# Blueprint
+# ==============================
 predict_bp = Blueprint('predict_bp', __name__)
 
-model = load_model('model/DoodleDashModel.keras')
-class_names = ['apple', 'axe', 'banana', 'bird', 'butterfly', 'cat', 'cup', 'envelope', 'fish', 'flower',
-            'hand', 'leaf', 'light bulb', 'moon', 'mountain', 'rain', 'star', 't-shirt', 'tree', 'wheel']
+# ==============================
+# Load Keras Model
+# ==============================
+keras_model = load_model('model/DoodleDashModel.keras')
+keras_class_names = [
+    'apple', 'axe', 'banana', 'bird', 'butterfly', 'cat', 'cup', 'envelope',
+    'fish', 'flower', 'hand', 'leaf', 'light bulb', 'moon', 'mountain', 'rain',
+    'star', 't-shirt', 'tree', 'wheel'
+]
 
+# ==============================
+# Load Scratch CNN Model
+# ==============================
+from train_cnn import OptimizedCNN  # ensure train_cnn.py is in project root or use relative import
+
+scratch_model = OptimizedCNN()
+scratch_model.load('model/scratch_cnn_model.npz')
+scratch_class_names = [
+    'butterfly', 'envelope', 'fish', 'flower', 'leaf', 'mountain', 'star', 'tree'
+]
+
+# ==============================
+# Image preprocessing
+# ==============================
+def preprocess_image(img_base64, target_size=(28,28), invert=True):
+    """
+    Convert base64 image to normalized numpy array for CNN input
+    """
+    img_bytes = base64.b64decode(img_base64)
+    img = Image.open(io.BytesIO(img_bytes)).convert('L')
+    if invert:
+        img = ImageOps.invert(img)
+    img = img.resize(target_size, Image.Resampling.LANCZOS)
+    img_array = np.array(img).astype('float32') / 255.0
+    return img_array
+
+# ==============================
+# Keras Prediction Endpoint
+# ==============================
 @predict_bp.route('/predict', methods=['POST'])
-def predict():
+def predict_keras():
     try:
         data = request.get_json()
         img_base64 = data.get('image')
-        
         if not img_base64:
             return jsonify({'error': 'Image not provided'}), 400
-        
-        # Decode the base64 image
-        img_bytes = base64.b64decode(img_base64)
-        img = Image.open(io.BytesIO(img_bytes)).convert('L')
-        
-        # Invert the image (black drawing on white background -> white drawing on black background)
-        img = ImageOps.invert(img)
-        
-        # Resize to 28x28 to match model input requirements
-        img = img.resize((28, 28), Image.Resampling.LANCZOS)
-        
-        # Convert to numpy array and normalize
-        img_array = np.array(img).astype('float32') / 255.0
-        
-        # Reshape for model input (batch_size, height, width, channels)
-        img_array = img_array.reshape(1, 28, 28, 1)
-        
-        # Make prediction
-        predictions = model.predict(img_array, verbose=0)[0]
-        
-        # Get top 3 predictions
+
+        img_array = preprocess_image(img_base64)
+        img_array = img_array.reshape(1, 28, 28, 1)  # Keras expects (batch, height, width, channels)
+
+        predictions = keras_model.predict(img_array, verbose=0)[0]
         top_indices = predictions.argsort()[-3:][::-1]
-        results = [
-            {"label": class_names[i], "confidence": float(predictions[i])}
-            for i in top_indices
-        ]
-        
+
+        results = [{"label": keras_class_names[i], "confidence": float(predictions[i])} for i in top_indices]
+
         return jsonify({'predictions': results})
-        
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ==============================
+# Scratch CNN Prediction Endpoint
+# ==============================
+@predict_bp.route('/predict/scratch', methods=['POST'])
+def predict_scratch():
+    try:
+        data = request.get_json()
+        img_base64 = data.get('image')
+        if not img_base64:
+            return jsonify({'error': 'Image not provided'}), 400
+
+        # Preprocess
+        img_array = preprocess_image(img_base64, target_size=(28,28), invert=True)
+        img_array = img_array.reshape(1, 28, 28)  # shape (batch, height, width) for scratch CNN
+
+        # Forward pass
+        probs = scratch_model.forward(img_array)
+        probs = np.array(probs).flatten()  # ensure 1D array even if batch=1
+
+        # Top 3 predictions
+        top_indices = probs.argsort()[-3:][::-1]
+        results = [{"label": scratch_class_names[i], "confidence": float(probs[i])} for i in top_indices]
+
+        return jsonify({'predictions': results})
+
     except Exception as e:
         return jsonify({'error': str(e)}), 500
